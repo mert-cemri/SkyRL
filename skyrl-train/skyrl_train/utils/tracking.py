@@ -40,8 +40,31 @@ class Tracking:
         if "wandb" in default_backend:
             import wandb
             from omegaconf import OmegaConf
+            import os
 
-            wandb.init(project=project_name, name=experiment_name, config=OmegaConf.to_container(config, resolve=True))
+            # Check for taxonomy feedback and modify project name accordingly
+            taxonomy_enabled = False
+            try:
+                # Check config first
+                if hasattr(config, 'environment') and hasattr(config.environment, 'skyrl_gym'):
+                    env_config = config.environment.skyrl_gym
+                    for env_name in ['tau_bench', 'retail', 'airline', 'healthcare', 'telecom', 'doordash']:
+                        if hasattr(env_config, env_name):
+                            env_specific_config = getattr(env_config, env_name)
+                            if hasattr(env_specific_config, 'TAXONOMY_FEEDBACK') and env_specific_config.TAXONOMY_FEEDBACK:
+                                taxonomy_enabled = True
+                                break
+                # Check environment variable as fallback
+                if not taxonomy_enabled and os.environ.get("TAXONOMY_FEEDBACK", "false").lower() == "true":
+                    taxonomy_enabled = True
+            except:
+                # Fallback to environment variable if config access fails
+                taxonomy_enabled = os.environ.get("TAXONOMY_FEEDBACK", "false").lower() == "true"
+
+            # Modify project name if taxonomy feedback is enabled
+            final_project_name = f"{project_name}_with_taxonomy_feedback" if taxonomy_enabled else project_name
+
+            wandb.init(project=final_project_name, name=experiment_name, config=OmegaConf.to_container(config, resolve=True))
             self.logger["wandb"] = wandb
 
         if "mlflow" in default_backend:
@@ -104,12 +127,14 @@ class Tracking:
         # https://github.com/wandb/wandb/issues/6449
         # TODO (sumanthrh): Check if this is really needed. Trackers like wandb will automatically finish at program exit.
         try:
-            if "wandb" in self.logger:
-                self.logger["wandb"].finish(exit_code=0)
+            # SKYRL MIGRATION: Commented out wandb.finish() to prevent premature termination
+            # wandb will handle cleanup automatically
+            # if "wandb" in self.logger:
+            #     self.logger["wandb"].finish(exit_code=0)
             if "swanlab" in self.logger:
                 self.logger["swanlab"].finish()
-            if "vemlp_wandb" in self.logger:
-                self.logger["vemlp_wandb"].finish(exit_code=0)
+            # if "vemlp_wandb" in self.logger:
+            #     self.logger["vemlp_wandb"].finish(exit_code=0)
             if "tensorboard" in self.logger:
                 self.logger["tensorboard"].finish()
             if "mlflow" in self.logger:

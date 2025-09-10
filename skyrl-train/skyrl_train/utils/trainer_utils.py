@@ -287,6 +287,7 @@ def dump_per_dataset_eval_results(
                     "env_class": concat_all_envs[i],
                     "env_extras": concat_env_extras[i],
                     "data_source": data_source,
+                    "conversation_history": concat_env_extras[i].get("conversation_history", []),
                 }
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 

@@ -35,6 +35,8 @@ class RemoteInferenceEngine(InferenceEngineInterface):
         prompts = input_batch.get("prompts")
         prompt_token_ids: Optional[List[List[int]]] = input_batch.get("prompt_token_ids")
         request_sampling_params = input_batch.get("sampling_params")
+        tools = input_batch.get("tools")
+        use_native_tool_calling = input_batch.get("use_native_tool_calling", False)
 
         assert (
             prompts is None and prompt_token_ids is not None
@@ -58,6 +60,10 @@ class RemoteInferenceEngine(InferenceEngineInterface):
                 payload = sampling_params.copy()
                 payload["model"] = self.model_name
                 payload["prompt"] = prompt_token_ids
+                # Add tool calling support
+                if use_native_tool_calling and tools:
+                    payload["tools"] = tools
+                    payload["use_native_tool_calling"] = use_native_tool_calling
                 request_url = f"{self.url}/v1/completions"
             elif self.engine_backend == "sglang":
                 # SGLang supports /generate, works exactly like its Python `async_generate()` method
@@ -66,6 +72,10 @@ class RemoteInferenceEngine(InferenceEngineInterface):
                     "input_ids": prompt_token_ids,
                     "sampling_params": sampling_params,
                 }
+                # Add tool calling support
+                if use_native_tool_calling and tools:
+                    payload["tools"] = tools
+                    payload["use_native_tool_calling"] = use_native_tool_calling
                 request_url = f"{self.url}/generate"
             else:
                 raise ValueError(f"Invalid engine backend: {self.engine_backend}")

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import math
 import os
 import shutil
@@ -141,76 +142,89 @@ class RayPPOTrainer:
         Returns:
             A dictionary of evaluation metrics.
         """
-        # 0. Make a copy of self.all_metrics (will restore at the end)
-        # eval() might accidentally mutate `self.all_metrics` since it is mutated in
-        # methods like `self.generate()`.
-        all_metrics_copy = self.all_metrics.copy()
+        # Set SKYRL_MODE to disable LLM Judge during evaluation to prevent inflated metrics
+        original_skyrl_mode = os.environ.get("SKYRL_MODE")
+        os.environ["SKYRL_MODE"] = "eval"
+        
+        try:
+            # 0. Make a copy of self.all_metrics (will restore at the end)
+            # eval() might accidentally mutate `self.all_metrics` since it is mutated in
+            # methods like `self.generate()`.
+            all_metrics_copy = self.all_metrics.copy()
 
-        # 1. Get all generator outputs
-        generator_outputs: List[GeneratorOutput] = []
-        concat_all_envs: List[str] = []
-        concat_env_extras: List[Dict[str, Any]] = []
-        concat_uids: List[str] = []
-        sampling_params = self.cfg.generator.eval_sampling_params
-        pbar = tqdm(total=len(self.eval_dataloader), initial=0, desc="Evaluation Progress")
-        for _, prompts in enumerate(self.eval_dataloader):
-            pbar.update(1)
-            generator_input, uids = self._prepare_generator_input(
-                self.cfg.generator.eval_n_samples_per_prompt, prompts, sampling_params
+            # 1. Get all generator outputs
+            generator_outputs: List[GeneratorOutput] = []
+            concat_all_envs: List[str] = []
+            concat_env_extras: List[Dict[str, Any]] = []
+            concat_uids: List[str] = []
+            sampling_params = self.cfg.generator.eval_sampling_params
+            pbar = tqdm(total=len(self.eval_dataloader), initial=0, desc="Evaluation Progress")
+            for _, prompts in enumerate(self.eval_dataloader):
+                pbar.update(1)
+                generator_input, uids = self._prepare_generator_input(
+                    self.cfg.generator.eval_n_samples_per_prompt, prompts, sampling_params
+                )
+                generator_output: GeneratorOutput = await self.generate(generator_input)
+                generator_outputs.append(generator_output)
+                concat_all_envs.extend(generator_input["env_classes"])
+                concat_env_extras.extend(generator_input["env_extras"])
+                concat_uids.extend(uids)
+            concat_generator_outputs: GeneratorOutput = concatenate_generator_outputs(generator_outputs)
+
+            # Extract data_sources from env_extras
+            concat_data_sources = [env_extra.get("data_source") for env_extra in concat_env_extras]
+            vis = self.tokenizer.decode(generator_output["response_ids"][0])
+            print("Eval output example: ", vis)
+
+            # 2. Group data by data source and calculate per-dataset metrics
+            eval_metrics = calculate_per_dataset_metrics(
+                concat_generator_outputs, concat_uids, concat_data_sources, self.cfg.generator.eval_n_samples_per_prompt
             )
-            generator_output: GeneratorOutput = await self.generate(generator_input)
-            generator_outputs.append(generator_output)
-            concat_all_envs.extend(generator_input["env_classes"])
-            concat_env_extras.extend(generator_input["env_extras"])
-            concat_uids.extend(uids)
-        concat_generator_outputs: GeneratorOutput = concatenate_generator_outputs(generator_outputs)
 
-        # Extract data_sources from env_extras
-        concat_data_sources = [env_extra.get("data_source") for env_extra in concat_env_extras]
-        vis = self.tokenizer.decode(generator_output["response_ids"][0])
-        print("Eval output example: ", vis)
+            # 3. Calculate overall metrics across all datasets
+            overall_avg_score, overall_pass_at_n = get_metrics_from_generator_output(concat_generator_outputs, concat_uids)
+            eval_metrics.update(
+                {
+                    "eval/all/avg_score": overall_avg_score,
+                    f"eval/all/pass_at_{self.cfg.generator.eval_n_samples_per_prompt}": overall_pass_at_n,
+                }
+            )
 
-        # 2. Group data by data source and calculate per-dataset metrics
-        eval_metrics = calculate_per_dataset_metrics(
-            concat_generator_outputs, concat_uids, concat_data_sources, self.cfg.generator.eval_n_samples_per_prompt
-        )
+            # 4. Prepare dumping data
+            # TODO[Ben] update this to be cloud-compatible
+            if self.cfg.trainer.dump_eval_results:
+                with Timer("dump_eval_results"):
+                    data_save_dir = (
+                        Path(self.cfg.trainer.export_path) / "dumped_evals" / f"global_step_{self.global_step}_evals"
+                    )
+                    data_save_dir.mkdir(parents=True, exist_ok=True)
+                    dump_per_dataset_eval_results(
+                        data_save_dir,
+                        self.tokenizer,
+                        concat_generator_outputs,
+                        concat_data_sources,
+                        concat_all_envs,
+                        concat_env_extras,
+                        eval_metrics,
+                    )
 
-        # 3. Calculate overall metrics across all datasets
-        overall_avg_score, overall_pass_at_n = get_metrics_from_generator_output(concat_generator_outputs, concat_uids)
-        eval_metrics.update(
-            {
-                "eval/all/avg_score": overall_avg_score,
-                f"eval/all/pass_at_{self.cfg.generator.eval_n_samples_per_prompt}": overall_pass_at_n,
-            }
-        )
+            # 5. Restore self.all_metrics
+            self.all_metrics = all_metrics_copy
 
-        # 4. Prepare dumping data
-        # TODO[Ben] update this to be cloud-compatible
-        if self.cfg.trainer.dump_eval_results:
-            with Timer("dump_eval_results"):
-                data_save_dir = (
-                    Path(self.cfg.trainer.export_path) / "dumped_evals" / f"global_step_{self.global_step}_evals"
-                )
-                data_save_dir.mkdir(parents=True, exist_ok=True)
-                dump_per_dataset_eval_results(
-                    data_save_dir,
-                    self.tokenizer,
-                    concat_generator_outputs,
-                    concat_data_sources,
-                    concat_all_envs,
-                    concat_env_extras,
-                    eval_metrics,
-                )
-
-        # 5. Restore self.all_metrics
-        self.all_metrics = all_metrics_copy
-
-        return eval_metrics
+            return eval_metrics
+        finally:
+            # Restore original SKYRL_MODE
+            if original_skyrl_mode is not None:
+                os.environ["SKYRL_MODE"] = original_skyrl_mode
+            else:
+                os.environ.pop("SKYRL_MODE", None)
 
     def train(self):
         """
         Main training loop for PPO
         """
+        # Set SKYRL_MODE to enable LLM Judge during training
+        os.environ["SKYRL_MODE"] = "train"
 
         self.global_step = 0
         self.weights_manager = InferenceWeightsManager(
@@ -292,6 +306,12 @@ class RayPPOTrainer:
                     # 1.2 postprocess rewards
                     with Timer("postprocess_generator_output", self.all_timings):
                         generator_output = self.postprocess_generator_output(generator_output, uids)
+
+                    # 1.3 log training examples with conversation history
+                    try:
+                        self._log_training_examples(generator_output, generator_input.get("env_extras", []))
+                    except Exception as e:
+                        logger.warning(f"Failed to log training examples: {e}")
 
                     # 2. print example just for debugging
                     vis = self.tokenizer.decode(generator_output["response_ids"][0])
@@ -728,6 +748,23 @@ class RayPPOTrainer:
         # add rollout metrics to self.all_metrics
         if generator_output["rollout_metrics"] is not None:
             self.all_metrics.update(generator_output["rollout_metrics"])
+
+        # Enhanced logging: immediate reward logging and parse failure tracking
+        if "rewards" in generator_output:
+            rewards = generator_output["rewards"]
+            if len(rewards) > 0:
+                avg_reward = sum(rewards) / len(rewards)
+                self.all_metrics.update({
+                    "train/immediate_avg_reward": avg_reward,
+                    "train/immediate_min_reward": min(rewards),
+                    "train/immediate_max_reward": max(rewards),
+                })
+        
+        # Track parse failures if available in rollout metrics
+        if generator_output["rollout_metrics"] is not None:
+            rollout_metrics = generator_output["rollout_metrics"]
+            if "generate/parse_failure_rate" in rollout_metrics:
+                self.all_metrics["train/parse_failure_rate"] = rollout_metrics["generate/parse_failure_rate"]
 
         validate_generator_output(input_batch, generator_output)
 
@@ -1413,3 +1450,41 @@ class RayPPOTrainer:
             logger.warning(f"Failed to clean up temporary policy export directory {policy_export_dir}: {e}")
 
         logger.info("Successfully update ref model with policy model, training continue.")
+    
+    def _log_training_examples(self, generator_output: GeneratorOutput, env_extras: List[Dict[str, Any]]) -> None:
+        """
+        Log training examples with full conversation history to exports directory.
+        
+        Args:
+            generator_output: The generator output containing responses and metadata
+            env_extras: Environment extras containing conversation history
+        """
+        if not hasattr(self, 'cfg') or not hasattr(self.cfg.trainer, 'export_path'):
+            return
+            
+        # Create training examples directory
+        training_examples_dir = Path(self.cfg.trainer.export_path) / "training_examples"
+        training_examples_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create filename with global step
+        filename = training_examples_dir / f"training_examples_step_{self.global_step}.jsonl"
+        
+        # Prepare training examples data
+        input_prompts = [self.tokenizer.decode(prompt) for prompt in generator_output["prompt_token_ids"]]
+        output_responses = [self.tokenizer.decode(response) for response in generator_output["response_ids"]]
+        
+        # Save training examples
+        with open(filename, "w") as f:
+            for i in range(len(input_prompts)):
+                example = {
+                    "global_step": self.global_step,
+                    "input_prompt": input_prompts[i],
+                    "output_response": output_responses[i],
+                    "reward": generator_output["rewards"][i],
+                    "stop_reason": generator_output.get("stop_reasons", [None] * len(input_prompts))[i],
+                    "conversation_history": env_extras[i].get("conversation_history", []) if i < len(env_extras) else [],
+                    "timestamp": self.all_timings.get("current_time", "unknown"),
+                }
+                f.write(json.dumps(example, ensure_ascii=False) + "\n")
+        
+        logger.info(f"Saved {len(input_prompts)} training examples to {filename}")

@@ -126,6 +126,17 @@ def apply_overlong_filtering(
 
 
 def get_rollout_metrics(responses: List[List[int]], rewards: Union[List[float], List[List[float]]]):
+    # Safety check for empty responses
+    if len(responses) == 0:
+        return {
+            "generate/min_num_tokens": 0,
+            "generate/max_num_tokens": 0,
+            "generate/avg_num_tokens": 0.0,
+            "generate/std_num_tokens": 0.0,
+            "generate/avg_tokens_non_zero_rewards": 0.0,
+            "generate/avg_tokens_zero_rewards": 0.0,
+        }
+    
     num_tokens_arr = np.array([len(response) for response in responses])
     # Support both response-level and token-level rewards
     flat_rewards = []

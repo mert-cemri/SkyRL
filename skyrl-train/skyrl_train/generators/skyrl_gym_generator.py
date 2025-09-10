@@ -65,6 +65,10 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         # optionally use custom chat template to get loss masks (i.e. for Qwen3)
         self.custom_chat_template = get_custom_chat_template(model_name)
+        # detect Qwen3 models for thinking mode control
+        self.is_qwen3_model = "Qwen3" in model_name
+        # native tool calling support
+        self.use_native_tool_calling = getattr(generator_cfg, 'use_native_tool_calling', False)
         # get generation prompt ids for the tokenizer if needed
         self.generation_prompt_ids = get_generation_prompt_ids(tokenizer) if self.use_conversation_multi_turn else None
         if self.skyrl_gym_cfg.max_env_workers > 0:
@@ -85,10 +89,15 @@ class SkyRLGymGenerator(GeneratorInterface):
             {"role": "user", "content": "I am a user."},
             {"role": "assistant", "content": "I am an assistant."},
         ]
+        # Apply chat template with Qwen3 thinking mode disabled if needed
+        base_kwargs = {}
+        if "Qwen3" in model_name:
+            base_kwargs["enable_thinking"] = False
         self.base_conversation_token_ids = tokenizer.apply_chat_template(
             self.base_conversation,
             add_generation_prompt=False,
             tokenize=True,
+            **base_kwargs,
         )
         # We remove tokens after the last EOS token so that it can be captured in `observation_ids`.
         # For details, see https://skyrl.readthedocs.io/en/latest/tutorials/skyrl_gym_generator.html#multi-turn-tokenization-and-ti-to
@@ -99,6 +108,14 @@ class SkyRLGymGenerator(GeneratorInterface):
                 - self.base_conversation_token_ids[::-1].index(self.tokenizer.eos_token_id)
             )
             self.base_conversation_token_ids = self.base_conversation_token_ids[: last_eos_token_index + 1]
+
+    def _apply_chat_template(self, messages, add_generation_prompt=True, tokenize=True, **kwargs):
+        """Helper method to apply chat template with Qwen3 thinking mode disabled."""
+        if self.is_qwen3_model:
+            kwargs["enable_thinking"] = False
+        return self.tokenizer.apply_chat_template(
+            messages, add_generation_prompt=add_generation_prompt, tokenize=tokenize, **kwargs
+        )
 
     async def _run_in_executor_if_available(self, func, *args, **kwargs):
         if (executor := self.env_executor) is not None:
@@ -156,10 +173,13 @@ class SkyRLGymGenerator(GeneratorInterface):
         chat_history = copy.deepcopy(prompt)
 
         # init() returns the first prompt to be given to the model, and optional metadata dict
-        chat_history, _ = await self._run_in_executor_if_available(env.init, chat_history)
+        chat_history, env_metadata = await self._run_in_executor_if_available(env.init, chat_history)
+        
+        # Extract tools from environment metadata for native tool calling
+        tools = env_metadata.get("tools", []) if env_metadata else []
         initial_chat_history_length = len(chat_history)
         chat_end_index = len(chat_history)
-        input_ids = self.tokenizer.apply_chat_template(
+        input_ids = self._apply_chat_template(
             chat_history,
             # If retokenize_chat_history==True, avoid including the generation prompt in both the
             # prompt_ids and response_ids due to how `response_encodings["input_ids"]` works.
@@ -178,12 +198,20 @@ class SkyRLGymGenerator(GeneratorInterface):
             # 1. Generate output
             if retokenize_chat_history:
                 engine_input = InferenceEngineInput(
-                    prompts=[chat_history], trajectory_ids=[trajectory_id], sampling_params=sampling_params
+                    prompts=[chat_history], 
+                    trajectory_ids=[trajectory_id], 
+                    sampling_params=sampling_params,
+                    tools=tools if self.use_native_tool_calling and tools else None,
+                    use_native_tool_calling=self.use_native_tool_calling
                 )
             else:
                 # Token-in-token-out.
                 engine_input = InferenceEngineInput(
-                    prompt_token_ids=[input_ids], trajectory_ids=[trajectory_id], sampling_params=sampling_params
+                    prompt_token_ids=[input_ids], 
+                    trajectory_ids=[trajectory_id], 
+                    sampling_params=sampling_params,
+                    tools=tools if self.use_native_tool_calling and tools else None,
+                    use_native_tool_calling=self.use_native_tool_calling
                 )
             engine_output = await self.inference_engine_client.generate(engine_input)
             output = engine_output["responses"][0]
@@ -252,16 +280,23 @@ class SkyRLGymGenerator(GeneratorInterface):
 
         prompt_ids = input_ids[:initial_prompt_length]
         if retokenize_chat_history:
-            response_encodings = self.tokenizer.apply_chat_template(
-                chat_history[initial_chat_history_length:],
-                chat_template=self.custom_chat_template,
-                add_generation_prompt=False,
-                return_dict=True,
-                return_assistant_tokens_mask=True,
-                tokenize=True,
-            )
-            loss_mask = response_encodings["assistant_masks"]
-            response_ids = response_encodings["input_ids"]
+            # Safety check: handle case where no responses were generated (e.g., eval_before_train)
+            response_messages = chat_history[initial_chat_history_length:]
+            if len(response_messages) == 0:
+                # No responses generated - return empty response_ids and loss_mask
+                response_ids = []
+                loss_mask = []
+            else:
+                response_encodings = self._apply_chat_template(
+                    response_messages,
+                    chat_template=self.custom_chat_template,
+                    add_generation_prompt=False,
+                    return_dict=True,
+                    return_assistant_tokens_mask=True,
+                    tokenize=True,
+                )
+                loss_mask = response_encodings["assistant_masks"]
+                response_ids = response_encodings["input_ids"]
         else:
             response_ids = input_ids[initial_prompt_length:]
             per_step_rewards = [(reward, idx - initial_prompt_length) for reward, idx in per_step_rewards]
@@ -336,12 +371,18 @@ class SkyRLGymGenerator(GeneratorInterface):
             env_extra["max_turns"] = self.max_turns
             env_config = self.skyrl_gym_cfg.get(env_class, DictConfig({}))
             env = skyrl_gym.make(env_class, env_config=env_config, extras=env_extra)
-            init_prompt, _ = await self._run_in_executor_if_available(env.init, prompt)
+            init_prompt, env_metadata = await self._run_in_executor_if_available(env.init, prompt)
+            # TODO: Handle per-environment tools extraction for batched generation
             init_prompts.append(init_prompt)
             envs.append(env)
 
         # For single-turn generation, we can use text-in-token-out, since we do not need to re-tokenize.
-        engine_input = InferenceEngineInput(prompts=init_prompts, sampling_params=sampling_params)
+        engine_input = InferenceEngineInput(
+            prompts=init_prompts, 
+            sampling_params=sampling_params,
+            tools=None,  # TODO: Extract tools from environments for batched generation
+            use_native_tool_calling=self.use_native_tool_calling
+        )
         engine_output = await self.inference_engine_client.generate(engine_input)
         responses = engine_output["responses"]
         all_response_ids = engine_output["response_ids"]
@@ -369,7 +410,7 @@ class SkyRLGymGenerator(GeneratorInterface):
 
             await self._run_in_executor_if_available(env.close)
 
-        prompt_token_ids = self.tokenizer.apply_chat_template(prompts, add_generation_prompt=True, tokenize=True)
+        prompt_token_ids = self._apply_chat_template(prompts, add_generation_prompt=True, tokenize=True)
         responses = truncated_responses
         rollout_metrics = get_rollout_metrics(responses, rewards)
 
@@ -522,7 +563,7 @@ class SkyRLGymGenerator(GeneratorInterface):
             chat_end_index += len(new_obs)
 
         # re-apply whole chat template so length check is correct
-        input_ids = self.tokenizer.apply_chat_template(
+        input_ids = self._apply_chat_template(
             chat_history[:chat_end_index],
             chat_template=self.custom_chat_template,
             add_generation_prompt=False,
@@ -590,7 +631,7 @@ class SkyRLGymGenerator(GeneratorInterface):
         if len(new_obs) > 0:
             # For Qwen, this will generate `\n<|user|>Some observation<|im_end|>\n`. Note that the
             # first `\n` is generated since we stripped it in ``base_conversation_token_ids``.
-            observation_ids = self.tokenizer.apply_chat_template(
+            observation_ids = self._apply_chat_template(
                 [*self.base_conversation, *new_obs],
                 add_generation_prompt=True,
                 tokenize=True,
